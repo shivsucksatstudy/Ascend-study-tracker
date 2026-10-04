@@ -1,0 +1,151 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+    paths: ['*.html', '.github/workflows/build-apk.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create Capacitor Android project
+        run: |
+          SRC=$( [ -f index.html ] && echo index.html || ls *.html | head -1 )
+          echo "Using $SRC"
+          mkdir -p capbuild/www
+          cp "$SRC" capbuild/www/index.html
+          cd capbuild
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          cat > capacitor.config.json <<'JSON'
+          {
+            "appId": "com.ascend.studytracker",
+            "appName": "Ascend",
+            "webDir": "www",
+            "backgroundColor": "#09080c",
+            "server": { "androidScheme": "https" }
+          }
+          JSON
+          npx cap add android
+          npx cap sync android
+
+      - name: Icons, theme, permissions, version
+        run: |
+          pip install pillow
+          cat > make_assets.py <<'PY'
+          import re, base64, io, os, sys, glob
+          from PIL import Image
+
+          src, res = sys.argv[1], sys.argv[2]
+          BG = (9, 8, 12, 255)  # #09080c
+          html = open(src, encoding='utf8').read()
+          m = re.search(r'<link rel="icon" href="data:image/png;base64,([A-Za-z0-9+/=]+)"', html)
+          if not m:
+              print('No embedded icon found, keeping default icons'); sys.exit(0)
+          icon = Image.open(io.BytesIO(base64.b64decode(m.group(1)))).convert('RGBA')
+
+          legacy = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
+          fg = {'mdpi': 108, 'hdpi': 162, 'xhdpi': 216, 'xxhdpi': 324, 'xxxhdpi': 432}
+
+          for d in legacy:
+              out = os.path.join(res, f'mipmap-{d}'); os.makedirs(out, exist_ok=True)
+              s = legacy[d]
+              sq = Image.new('RGBA', (s, s), BG)
+              sq.alpha_composite(icon.resize((s, s), Image.LANCZOS))
+              ic = icon.resize((s, s), Image.LANCZOS)
+              ic.save(os.path.join(out, 'ic_launcher.png'))
+              # round version
+              mask = Image.new('L', (s * 4, s * 4), 0)
+              from PIL import ImageDraw
+              ImageDraw.Draw(mask).ellipse((0, 0, s * 4 - 1, s * 4 - 1), fill=255)
+              mask = mask.resize((s, s), Image.LANCZOS)
+              rd = Image.new('RGBA', (s, s), (0, 0, 0, 0)); rd.paste(sq, (0, 0), mask)
+              rd.save(os.path.join(out, 'ic_launcher_round.png'))
+              # adaptive foreground: artwork at ~64% of the 108dp canvas (inside the safe zone)
+              f = fg[d]; inner = int(f * 0.64)
+              canvas = Image.new('RGBA', (f, f), (0, 0, 0, 0))
+              canvas.alpha_composite(icon.resize((inner, inner), Image.LANCZOS), ((f - inner) // 2, (f - inner) // 2))
+              canvas.save(os.path.join(out, 'ic_launcher_foreground.png'))
+
+          adaptive = '''<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          '''
+          v26 = os.path.join(res, 'mipmap-anydpi-v26'); os.makedirs(v26, exist_ok=True)
+          for n in ('ic_launcher.xml', 'ic_launcher_round.xml'):
+              open(os.path.join(v26, n), 'w').write(adaptive)
+          os.makedirs(os.path.join(res, 'values'), exist_ok=True)
+          open(os.path.join(res, 'values', 'ic_launcher_background.xml'), 'w').write(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#09080C</color>\n</resources>\n')
+          # status bar / theme colors
+          open(os.path.join(res, 'values', 'colors.xml'), 'w').write(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="colorPrimary">#09080C</color>\n    <color name="colorPrimaryDark">#09080C</color>\n    <color name="colorAccent">#A463ED</color>\n</resources>\n')
+          # solid dark splash instead of the default Capacitor logo
+          for p in glob.glob(os.path.join(res, '**', 'splash.png'), recursive=True):
+              w, h = Image.open(p).size
+              Image.new('RGB', (w, h), BG[:3]).save(p)
+          print('Icons and theme generated')
+          PY
+          SRC=$( [ -f index.html ] && echo index.html || ls *.html | head -1 )
+          RES=capbuild/android/app/src/main/res
+          python3 make_assets.py "$SRC" "$RES"
+          MANIFEST=capbuild/android/app/src/main/AndroidManifest.xml
+          grep -q 'VIBRATE' "$MANIFEST" || sed -i 's#<uses-permission android:name="android.permission.INTERNET" />#&\n    <uses-permission android:name="android.permission.VIBRATE" />#' "$MANIFEST"
+          GR=capbuild/android/app/build.gradle
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName \"1.0\"/versionName \"1.${{ github.run_number }}\"/" "$GR"
+
+      - name: Build release APK
+        working-directory: capbuild/android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > ks.p12
+            PASS="$KEYSTORE_PASSWORD"
+            echo "Signing with your permanent key"
+          else
+            echo "::warning::No signing key secrets found. Using a temporary key, so updates will need an uninstall first."
+            PASS=temporary123
+            keytool -genkeypair -keystore ks.p12 -storetype PKCS12 -alias ascend -keyalg RSA -keysize 2048 -validity 10000 -storepass "$PASS" -keypass "$PASS" -dname "CN=Ascend"
+          fi
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          UNSIGNED=$(ls capbuild/android/app/build/outputs/apk/release/*.apk | head -1)
+          $BT/zipalign -p -f 4 "$UNSIGNED" aligned.apk
+          $BT/apksigner sign --ks ks.p12 --ks-pass "pass:$PASS" --ks-key-alias ascend --out Ascend.apk aligned.apk
+          $BT/apksigner verify Ascend.apk
+          rm -f ks.p12
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ github.run_number }}" Ascend.apk \
+            --title "Ascend v${{ github.run_number }}" \
+            --notes "Download Ascend.apk below and install it on Android."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ascend-apk
+          path: Ascend.apk
